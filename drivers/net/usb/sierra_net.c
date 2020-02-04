@@ -25,13 +25,17 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
-#define DRIVER_VERSION "v.2.0"
+#define DRIVER_VERSION "v.3.0"
 #define DRIVER_AUTHOR "Paxton Smith, Matthew Safar, Rory Filer"
 #define DRIVER_DESC "USB-to-WWAN Driver for Sierra Wireless modems"
 static const char driver_name[] = "sierra_net";
 
 /* if defined debug messages enabled */
 /*#define	DEBUG*/
+/* more debug messages */
+/*#define	VERBOSE*/
+/* Uncomment to force power level set to auto when attaching a device */
+/*#define POWER_LEVEL_AUTO*/
 
 #include <linux/module.h>
 #include <linux/etherdevice.h>
@@ -48,6 +52,7 @@ static const char driver_name[] = "sierra_net";
 
 #define SWI_USB_REQUEST_GET_FW_ATTR	0x06
 #define SWI_GET_FW_ATTR_MASK		0x08
+#define SWI_GET_FW_ATTR_APM			0x2
 
 /* atomic counter partially included in MAC address to make sure 2 devices
  * do not end up with the same MAC - concept breaks in case of > 255 ifaces
@@ -131,6 +136,7 @@ struct param {
 #define SIERRA_NET_SESSION_IDLE       0x00
 /* LSI Link types */
 #define SIERRA_NET_AS_LINK_TYPE_IPv4  0x00
+#define SIERRA_NET_AS_LINK_TYPE_IPv6  0x02
 
 struct lsi_umts {
 	u8 protocol;
@@ -192,10 +198,10 @@ static inline void sierra_net_set_private(struct usbnet *dev,
 	dev->data[0] = (unsigned long)priv;
 }
 
-/* is packet IPv4 */
+/* is packet IP */
 static inline int is_ip(struct sk_buff *skb)
 {
-	return skb->protocol == cpu_to_be16(ETH_P_IP);
+	return (skb->protocol == cpu_to_be16(ETH_P_IP));
 }
 
 /*
@@ -304,6 +310,24 @@ static void build_hip(u8 *buf, const u16 payloadlen,
 /*----------------------------------------------------------------------------*
  *                              END HIP                                       *
  *----------------------------------------------------------------------------*/
+/* This should come out before going to kernel.org */
+static void sierra_net_printk_buf(u8 *buf, u16 len)
+{
+#ifdef VERBOSE
+	u16 i;
+	u16 k;
+
+	for (i = k = 0; i < len / 4; i++, k += 4) {
+		printk(KERN_DEBUG "%02x%02x%02x%02x ",
+			buf[k+0], buf[k+1], buf[k+2], buf[k+3]);
+	}
+
+	for (; k < len;  k++)
+		printk(KERN_DEBUG "%02x", buf[k]);
+
+	printk("\n");
+#endif
+}
 
 static int sierra_net_send_cmd(struct usbnet *dev,
 		u8 *cmd, int cmdlen, const char * cmd_name)
@@ -311,9 +335,11 @@ static int sierra_net_send_cmd(struct usbnet *dev,
 	struct sierra_net_data *priv = sierra_net_get_private(dev);
 	int  status;
 
+	usb_autopm_get_interface(dev->intf);
 	status = usbnet_write_cmd(dev, USB_CDC_SEND_ENCAPSULATED_COMMAND,
 				  USB_DIR_OUT|USB_TYPE_CLASS|USB_RECIP_INTERFACE,
 				  0, priv->ifnum, cmd, cmdlen);
+	usb_autopm_put_interface(dev->intf);
 
 	if (status != cmdlen && status != -ENODEV)
 		netdev_err(dev->net, "Submit %s failed %d\n", cmd_name, status);
@@ -334,6 +360,16 @@ static int sierra_net_send_sync(struct usbnet *dev)
 	return status;
 }
 
+static void sierra_net_send_shutdown(struct usbnet *dev)
+{
+	struct sierra_net_data *priv = sierra_net_get_private(dev);
+
+	dev_dbg(&dev->udev->dev, "%s", __func__);
+
+	sierra_net_send_cmd(dev, priv->shdwn_msg,
+			sizeof(priv->shdwn_msg), "Shutdown");
+}
+
 static void sierra_net_set_ctx_index(struct sierra_net_data *priv, u8 ctx_ix)
 {
 	dev_dbg(&(priv->usbnet->udev->dev), "%s %d", __func__, ctx_ix);
@@ -345,7 +381,7 @@ static void sierra_net_set_ctx_index(struct sierra_net_data *priv, u8 ctx_ix)
 
 static inline int sierra_net_is_valid_addrlen(u8 len)
 {
-	return len == sizeof(struct in_addr);
+	return (len == sizeof(struct in_addr));
 }
 
 static int sierra_net_parse_lsi(struct usbnet *dev, char *data, int datalen)
@@ -375,9 +411,9 @@ static int sierra_net_parse_lsi(struct usbnet *dev, char *data, int datalen)
 
 	/* Validate the link type */
 	if (lsi->link_type != SIERRA_NET_AS_LINK_TYPE_IPv4) {
-		netdev_err(dev->net, "Link type unsupported: 0x%02x\n",
+		netdev_err(dev->net, "Link unavailable: 0x%02x",
 			lsi->link_type);
-		return -1;
+		return 0;
 	}
 
 	/* Validate the coverage */
@@ -469,13 +505,15 @@ static void sierra_net_kevent(struct work_struct *work)
 			return;
 
 		ifnum = priv->ifnum;
+		usb_autopm_get_interface(dev->intf);
 		len = usb_control_msg(dev->udev, usb_rcvctrlpipe(dev->udev, 0),
 				USB_CDC_GET_ENCAPSULATED_RESPONSE,
 				USB_DIR_IN|USB_TYPE_CLASS|USB_RECIP_INTERFACE,
 				0, ifnum, buf, SIERRA_NET_USBCTL_BUF_LEN,
 				USB_CTRL_SET_TIMEOUT);
+		usb_autopm_put_interface(dev->intf);
 
-		if (len < 0) {
+		if (unlikely(len < 0)) {
 			netdev_err(dev->net,
 				"usb_control_msg failed, status %d\n", len);
 		} else {
@@ -483,6 +521,7 @@ static void sierra_net_kevent(struct work_struct *work)
 
 			dev_dbg(&dev->udev->dev, "%s: Received status message,"
 				" %04x bytes", __func__, len);
+			sierra_net_printk_buf(buf, len);
 
 			err = parse_hip(buf, len, &hh);
 			if (err) {
@@ -529,7 +568,10 @@ static void sierra_net_kevent(struct work_struct *work)
 					"extmsgid 0x%04x\n", hh.extmsgid.word);
 				break;
 			case SIERRA_NET_HIP_RCGI:
-				/* Ignored */
+				/* Ignored. It is a firmware
+				 * workaround to solve a  Windows driver bug and
+				 * may be removed in the future. 
+				 */
 				break;
 			default:
 				netdev_err(dev->net, "Unrecognized HIP msg, "
@@ -556,7 +598,10 @@ static void sierra_net_defer_kevent(struct usbnet *dev, int work)
 	struct sierra_net_data *priv = sierra_net_get_private(dev);
 
 	set_bit(work, &priv->kevent_flags);
-	schedule_work(&priv->sierra_net_kevent);
+	if (!schedule_work(&priv->sierra_net_kevent))
+		dev_dbg(&dev->udev->dev, "sierra_net_kevent %d may have been dropped", work);
+	else
+		dev_dbg(&dev->udev->dev, "sierra_net_kevent %d scheduled", work);
 }
 
 /*
@@ -576,6 +621,7 @@ static void sierra_net_status(struct usbnet *dev, struct urb *urb)
 	struct usb_cdc_notification *event;
 
 	dev_dbg(&dev->udev->dev, "%s", __func__);
+	sierra_net_printk_buf(urb->transfer_buffer, urb->actual_length);
 
 	if (urb->actual_length < sizeof *event)
 		return;
@@ -636,7 +682,7 @@ static int sierra_net_get_fw_attr(struct usbnet *dev, u16 *datap)
 {
 	int result = 0;
 	__le16 attrdata;
-
+	usb_autopm_get_interface(dev->intf);
 	result = usbnet_read_cmd(dev,
 				/* _u8 vendor specific request */
 				SWI_USB_REQUEST_GET_FW_ATTR,
@@ -646,12 +692,19 @@ static int sierra_net_get_fw_attr(struct usbnet *dev, u16 *datap)
 				&attrdata,	/* char *data */
 				sizeof(attrdata)	/* __u16 size */
 				);
+	usb_autopm_put_interface(dev->intf);
 
 	if (result < 0)
 		return -EIO;
 
 	*datap = le16_to_cpu(attrdata);
 	return result;
+}
+
+static int sierra_net_manage_power(struct usbnet *dev, int on)
+{
+	dev->intf->needs_remote_wakeup = on;
+	return 0;
 }
 
 /*
@@ -695,6 +748,10 @@ static int sierra_net_bind(struct usbnet *dev, struct usb_interface *intf)
 
 	priv->usbnet = dev;
 	priv->ifnum = ifacenum;
+	/* override change_mtu with our own routine - need to bound check */
+	/* replace structure to our own structure where we have our own
+	 *  routine - need to bound check
+	 */
 	dev->net->netdev_ops = &sierra_net_device_ops;
 
 	/* change MAC addr to include, ifacenum, and to be unique */
@@ -740,7 +797,20 @@ static int sierra_net_bind(struct usbnet *dev, struct usb_interface *intf)
 	/* verify fw attributes */
 	status = sierra_net_get_fw_attr(dev, &fwattr);
 	dev_dbg(&dev->udev->dev, "Fw attr: %x\n", fwattr);
-
+	if (status == sizeof(fwattr) && (fwattr & SWI_GET_FW_ATTR_APM)) {
+/******************************************************************************* 
+ * If you want the default /sys/bus/usb/devices/.../.../power/level to be forced
+ * to auto, the following needs to be compiled in.
+ */ 
+#ifdef POWER_LEVEL_AUTO
+		/* make power level default be 'auto' */
+		dev_dbg(&dev->udev->dev, "Enabling APM");
+		usb_enable_autosuspend(dev->udev);
+#endif
+	} else {
+		dev_info(&intf->dev, "Disabling APM - not supported");
+		usb_disable_autosuspend(dev->udev);
+	}
 	/* test whether firmware supports DHCP */
 	if (!(status == sizeof(fwattr) && (fwattr & SWI_GET_FW_ATTR_MASK))) {
 		/* found incompatible firmware version */
@@ -755,26 +825,40 @@ static int sierra_net_bind(struct usbnet *dev, struct usb_interface *intf)
 
 static void sierra_net_unbind(struct usbnet *dev, struct usb_interface *intf)
 {
-	int status;
 	struct sierra_net_data *priv = sierra_net_get_private(dev);
 
 	dev_dbg(&dev->udev->dev, "%s", __func__);
 
-	/* kill the timer and work */
+	sierra_net_set_private(dev, NULL);
+
+	kfree(priv);
+}
+
+static int sierra_net_open(struct usbnet *dev)
+{
+	dev_dbg(&dev->udev->dev, "%s", __func__);
+
+	/* initiate the sync sequence */
+	sierra_net_dosync(dev);
+
+	return 0;
+}
+
+static int sierra_net_stop(struct usbnet *dev)
+{
+	struct sierra_net_data *priv = sierra_net_get_private(dev);
+
+	dev_dbg(&dev->udev->dev, "%s", __func__);
+
+	/* Kill the timer then flush the work queue */
 	del_timer_sync(&priv->sync_timer);
-	cancel_work_sync(&priv->sierra_net_kevent);
+
+	flush_scheduled_work();
 
 	/* tell modem we are going away */
-	status = sierra_net_send_cmd(dev, priv->shdwn_msg,
-			sizeof(priv->shdwn_msg), "Shutdown");
-	if (status < 0)
-		netdev_err(dev->net,
-			"usb_control_msg failed, status %d\n", status);
+	sierra_net_send_shutdown(dev);
 
-	usbnet_status_stop(dev);
-
-	sierra_net_set_private(dev, NULL);
-	kfree(priv);
+	return 0;
 }
 
 static struct sk_buff *sierra_net_skb_clone(struct usbnet *dev,
@@ -808,6 +892,8 @@ static int sierra_net_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 	struct sk_buff *new_skb;
 
 	dev_dbg(&dev->udev->dev, "%s", __func__);
+
+	sierra_net_printk_buf(skb->data, skb->len);
 
 	/* could contain multiple packets */
 	while (likely(skb->len)) {
@@ -885,6 +971,8 @@ static struct sk_buff *sierra_net_tx_fixup(struct usbnet *dev,
 				}
 			}
 			build_hip(skb->data, len, priv);
+
+            sierra_net_printk_buf(skb->data, skb->len);
 			return skb;
 		} else {
 			/*
@@ -904,6 +992,12 @@ static struct sk_buff *sierra_net_tx_fixup(struct usbnet *dev,
 	return NULL;
 }
 
+static int sierra_net_reset_resume(struct usb_interface *intf)
+{
+	struct usbnet	*dev = usb_get_intfdata(intf);
+	netdev_err(dev->net, "%s\n", __func__);
+	return usbnet_resume(intf);
+}
 static const struct driver_info sierra_net_info_direct_ip = {
 	.description = "Sierra Wireless USB-to-WWAN Modem",
 	.flags = FLAG_WWAN | FLAG_SEND_ZLP,
@@ -912,6 +1006,9 @@ static const struct driver_info sierra_net_info_direct_ip = {
 	.status = sierra_net_status,
 	.rx_fixup = sierra_net_rx_fixup,
 	.tx_fixup = sierra_net_tx_fixup,
+	.manage_power = sierra_net_manage_power,
+	.stop = sierra_net_stop,
+	.check_connect = sierra_net_open,
 };
 
 static int
@@ -958,7 +1055,9 @@ static struct usb_driver sierra_net_driver = {
 	.disconnect = usbnet_disconnect,
 	.suspend = usbnet_suspend,
 	.resume = usbnet_resume,
+	.reset_resume = sierra_net_reset_resume,
 	.no_dynamic_id = 1,
+	.supports_autosuspend = 1,
 	.disable_hub_initiated_lpm = 1,
 };
 
