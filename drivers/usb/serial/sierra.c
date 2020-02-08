@@ -16,7 +16,7 @@
   Portions based on the option driver by Matthias Urlichs <smurf@smurf.noris.de>
   Whom based his on the Keyspan driver by Hugh Blemings <hugh@blemings.org>
 */
-#define POWER_LEVEL_AUTO
+//#define POWER_LEVEL_AUTO
 
 /* Sierra driver for kernel 2.6.35 to kernel-3.0 */
 /* Note: This is 'combined' usb serial driver developed specifically for Android
@@ -811,8 +811,18 @@ static int sierra_create_sysfs_attrs(struct usb_serial_port *port)
 }
 static int sierra_remove_sysfs_attrs(struct usb_serial_port *port)
 {
+	int i;
+	struct usb_serial_port *port_tmp;
+	dev_dbg(&port->dev, "%s\n", __func__);
+
 	device_remove_file(&port->dev, &dev_attr_stats);
 	device_remove_file(&port->dev, &dev_attr_suspend_status);
+	for (i = 0; i < port->serial->num_ports; ++i) {
+		port_tmp = port->serial->port[i];
+		if (!port_tmp)
+			continue;
+		usb_set_serial_port_data(port_tmp, NULL);
+	}    
 	return 0;
 }
 static void sierra_outdat_callback(struct urb *urb)
